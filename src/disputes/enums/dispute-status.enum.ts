@@ -1,0 +1,19 @@
+export enum DisputeStatus {
+  NEW = "NEW",
+  UNDER_REVIEW = "UNDER_REVIEW",
+  WAITING_FOR_CUSTOMER = "WAITING_FOR_CUSTOMER",
+  ESCALATED = "ESCALATED",
+  RESOLVED = "RESOLVED",
+  CLOSED = "CLOSED",
+}
+
+export enum UserRole {
+  AGENT = "AGENT",
+  SUPERVISOR = "SUPERVISOR",
+}
+
+export enum ActorType {
+  AGENT = "AGENT",
+  CUSTOMER = "CUSTOMER",
+  SYSTEM = "SYSTEM",
+}
