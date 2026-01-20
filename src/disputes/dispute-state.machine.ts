@@ -1,96 +1,152 @@
 import { Injectable, BadRequestException } from "@nestjs/common"
-import { DisputeStatus, UserRole, ActorType } from "./enums/dispute-status.enum"
+import { DisputeStatus } from "@prisma/client"
+
+export enum UserRole {
+  AGENT = "AGENT",
+  SUPERVISOR = "SUPERVISOR",
+  SYSTEM = "SYSTEM",
+}
 
 interface TransitionRule {
   fromStates: DisputeStatus[]
   allowedRoles: UserRole[]
-  allowedActorTypes: ActorType[]
+  description: string
+}
+
+interface StateTransitionMap {
+  [status in DisputeStatus]?: TransitionRule
 }
 
 @Injectable()
 export class DisputeStateMachine {
-  private readonly transitionRules: Map<DisputeStatus, TransitionRule> = new Map([
+  private readonly transitionMap: Map<DisputeStatus, StateTransitionMap> = new Map([
     [
-      DisputeStatus.NEW,
+      DisputeStatus.OPEN,
       {
-        fromStates: [DisputeStatus.NEW],
-        allowedRoles: [UserRole.AGENT, UserRole.SUPERVISOR],
-        allowedActorTypes: [ActorType.AGENT, ActorType.SYSTEM],
+        IN_PROGRESS: {
+          fromStates: [DisputeStatus.OPEN],
+          allowedRoles: [UserRole.AGENT, UserRole.SUPERVISOR],
+          description: "Agent or Supervisor can start investigating",
+        },
+        ESCALATED: {
+          fromStates: [DisputeStatus.OPEN],
+          allowedRoles: [UserRole.SUPERVISOR],
+          description: "Only Supervisor can escalate from OPEN",
+        },
+        RESOLVED: {
+          fromStates: [DisputeStatus.OPEN],
+          allowedRoles: [UserRole.SUPERVISOR],
+          description: "Only Supervisor can resolve directly from OPEN",
+        },
       },
     ],
     [
-      DisputeStatus.UNDER_REVIEW,
+      DisputeStatus.IN_PROGRESS,
       {
-        fromStates: [DisputeStatus.NEW],
-        allowedRoles: [UserRole.AGENT, UserRole.SUPERVISOR],
-        allowedActorTypes: [ActorType.AGENT, ActorType.SYSTEM],
-      },
-    ],
-    [
-      DisputeStatus.WAITING_FOR_CUSTOMER,
-      {
-        fromStates: [DisputeStatus.UNDER_REVIEW],
-        allowedRoles: [UserRole.AGENT, UserRole.SUPERVISOR],
-        allowedActorTypes: [ActorType.AGENT, ActorType.SYSTEM],
+        ESCALATED: {
+          fromStates: [DisputeStatus.IN_PROGRESS],
+          allowedRoles: [UserRole.AGENT, UserRole.SUPERVISOR],
+          description: "Agent or Supervisor can escalate during investigation",
+        },
+        RESOLVED: {
+          fromStates: [DisputeStatus.IN_PROGRESS],
+          allowedRoles: [UserRole.AGENT, UserRole.SUPERVISOR],
+          description: "Agent or Supervisor can resolve",
+        },
+        OPEN: {
+          fromStates: [DisputeStatus.IN_PROGRESS],
+          allowedRoles: [UserRole.SUPERVISOR],
+          description: "Supervisor can revert to OPEN if needed",
+        },
       },
     ],
     [
       DisputeStatus.ESCALATED,
       {
-        fromStates: [DisputeStatus.UNDER_REVIEW, DisputeStatus.WAITING_FOR_CUSTOMER],
-        allowedRoles: [UserRole.SUPERVISOR],
-        allowedActorTypes: [ActorType.AGENT, ActorType.SYSTEM],
+        RESOLVED: {
+          fromStates: [DisputeStatus.ESCALATED],
+          allowedRoles: [UserRole.SUPERVISOR],
+          description: "Supervisor can resolve escalated dispute",
+        },
+        IN_PROGRESS: {
+          fromStates: [DisputeStatus.ESCALATED],
+          allowedRoles: [UserRole.SUPERVISOR],
+          description: "Supervisor can reassign back to investigation",
+        },
       },
     ],
     [
       DisputeStatus.RESOLVED,
       {
-        fromStates: [DisputeStatus.UNDER_REVIEW, DisputeStatus.WAITING_FOR_CUSTOMER, DisputeStatus.ESCALATED],
-        allowedRoles: [UserRole.AGENT, UserRole.SUPERVISOR],
-        allowedActorTypes: [ActorType.AGENT, ActorType.SYSTEM],
+        CLOSED: {
+          fromStates: [DisputeStatus.RESOLVED],
+          allowedRoles: [UserRole.SUPERVISOR],
+          description: "Supervisor closes resolved dispute",
+        },
+        IN_PROGRESS: {
+          fromStates: [DisputeStatus.RESOLVED],
+          allowedRoles: [UserRole.SUPERVISOR],
+          description: "Supervisor can reopen if new information emerges",
+        },
       },
     ],
     [
       DisputeStatus.CLOSED,
       {
-        fromStates: [DisputeStatus.RESOLVED, DisputeStatus.ESCALATED],
-        allowedRoles: [UserRole.SUPERVISOR],
-        allowedActorTypes: [ActorType.AGENT, ActorType.SYSTEM],
+        RESOLVED: {
+          fromStates: [DisputeStatus.CLOSED],
+          allowedRoles: [UserRole.SUPERVISOR],
+          description: "Supervisor can reopen closed dispute for review",
+        },
       },
     ],
   ])
 
-  canTransition(
-    fromState: DisputeStatus,
-    toState: DisputeStatus,
-    userRole: UserRole,
-    actorType: ActorType = ActorType.AGENT,
-  ): boolean {
-    const rule = this.transitionRules.get(toState)
-
-    if (!rule) {
-      throw new BadRequestException(`Invalid target state: ${toState}`)
+  validateTransition(fromState: DisputeStatus, toState: DisputeStatus, userRole: UserRole): void {
+    if (fromState === toState) {
+      throw new BadRequestException(`Cannot transition to the same state: ${fromState}`)
     }
 
-    const isValidTransition = rule.fromStates.includes(fromState)
-    const isValidRole = rule.allowedRoles.includes(userRole)
-    const isValidActorType = rule.allowedActorTypes.includes(actorType)
+    const transitionsFromState = this.transitionMap.get(fromState)
+    if (!transitionsFromState) {
+      throw new BadRequestException(`No transitions defined for state: ${fromState}`)
+    }
 
-    return isValidTransition && isValidRole && isValidActorType
+    const rule = transitionsFromState[toState as DisputeStatus]
+    if (!rule) {
+      throw new BadRequestException(`Transition from ${fromState} to ${toState} is not allowed`)
+    }
+
+    if (!rule.allowedRoles.includes(userRole)) {
+      throw new BadRequestException(
+        `Role ${userRole} cannot perform transition from ${fromState} to ${toState}. ` +
+          `Allowed roles: ${rule.allowedRoles.join(", ")}`,
+      )
+    }
   }
 
-  validateTransition(
-    fromState: DisputeStatus,
-    toState: DisputeStatus,
-    userRole: UserRole,
-    actorType: ActorType = ActorType.AGENT,
-  ): void {
-    if (fromState === toState) {
-      throw new BadRequestException("Cannot transition to the same state")
+  getValidNextStates(currentState: DisputeStatus, userRole: UserRole): DisputeStatus[] {
+    const transitionsFromState = this.transitionMap.get(currentState)
+    if (!transitionsFromState) {
+      return []
     }
 
-    if (!this.canTransition(fromState, toState, userRole, actorType)) {
-      throw new BadRequestException(`Transition from ${fromState} to ${toState} is not allowed for role ${userRole}`)
+    return Object.entries(transitionsFromState)
+      .filter(([_, rule]) => rule.allowedRoles.includes(userRole))
+      .map(([status]) => status as DisputeStatus)
+  }
+
+  canTransition(fromState: DisputeStatus, toState: DisputeStatus, userRole: UserRole): boolean {
+    try {
+      this.validateTransition(fromState, toState, userRole)
+      return true
+    } catch {
+      return false
     }
+  }
+
+  getTransitionRule(fromState: DisputeStatus, toState: DisputeStatus): TransitionRule | null {
+    const transitionsFromState = this.transitionMap.get(fromState)
+    return transitionsFromState?.[toState as DisputeStatus] || null
   }
 }

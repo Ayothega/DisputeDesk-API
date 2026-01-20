@@ -4,7 +4,7 @@ import { DisputeStatus } from "../enums/dispute-status.enum"
 export class TransitionDisputeDto {
   @IsEnum(DisputeStatus)
   @IsNotEmpty()
-  toState: DisputeStatus
+  toStatus: DisputeStatus
 
   @IsString()
   @IsOptional()

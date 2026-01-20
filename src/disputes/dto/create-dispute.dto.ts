@@ -1,19 +1,19 @@
-import { IsString, IsInt, Min, IsNotEmpty } from "class-validator"
+import { IsString, IsDecimal, IsNotEmpty, IsOptional } from "class-validator"
 
 export class CreateDisputeDto {
   @IsString()
   @IsNotEmpty()
-  customerId: string
+  externalId: string
 
   @IsString()
   @IsNotEmpty()
-  category: string
+  reason: string
+
+  @IsDecimal()
+  @IsNotEmpty()
+  amount: number
 
   @IsString()
-  @IsNotEmpty()
-  description: string
-
-  @IsInt()
-  @Min(0)
-  monetaryImpact: number
+  @IsOptional()
+  currency?: string
 }

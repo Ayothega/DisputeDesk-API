@@ -1,0 +1,170 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users     User[]
+  disputes  Dispute[]
+  slas      SLA[]
+  audits    AuditLog[]
+}
+
+model User {
+  id             String   @id @default(cuid())
+  email          String   @unique
+  passwordHash   String
+  firstName      String?
+  lastName       String?
+  role           UserRole @default(AGENT)
+  organizationId String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdDisputes Dispute[] @relation("CreatedBy")
+  assignedDisputes Dispute[] @relation("AssignedTo")
+  transitions    DisputeTransition[] @relation("TransitionedBy")
+  audits         AuditLog[] @relation("AuditUser")
+  notifications  Notification[]
+
+  @@index([organizationId])
+}
+
+enum UserRole {
+  AGENT
+  SUPERVISOR
+  ADMIN
+}
+
+model Dispute {
+  id              String          @id @default(cuid())
+  externalId      String          @unique
+  organizationId  String
+  createdById     String
+  assignedToId    String?
+  status          DisputeStatus   @default(OPEN)
+  reason          String
+  amount          Decimal         @db.Numeric(15, 2)
+  currency        String          @default("USD")
+  escalationLevel Int             @default(0)
+  closureReason   String?
+  slaId           String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy      User @relation("CreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  assignedTo     User? @relation("AssignedTo", fields: [assignedToId], references: [id], onDelete: SetNull)
+  sla            SLA? @relation(fields: [slaId], references: [id], onDelete: SetNull)
+  transitions    DisputeTransition[]
+  notifications  Notification[]
+  audits         AuditLog[] @relation("DisputeAudit")
+
+  @@index([organizationId])
+  @@index([createdById])
+  @@index([assignedToId])
+  @@index([status])
+  @@index([slaId])
+}
+
+enum DisputeStatus {
+  OPEN
+  IN_PROGRESS
+  ESCALATED
+  RESOLVED
+  CLOSED
+}
+
+model DisputeTransition {
+  id            String   @id @default(cuid())
+  disputeId     String
+  fromStatus    DisputeStatus
+  toStatus      DisputeStatus
+  transitionedById String
+  reason        String?
+  metadata      Json?
+  createdAt     DateTime @default(now())
+
+  dispute       Dispute @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+  transitionedBy User @relation("TransitionedBy", fields: [transitionedById], references: [id], onDelete: Restrict)
+
+  @@index([disputeId])
+  @@index([transitionedById])
+  @@index([createdAt])
+}
+
+model SLA {
+  id                String   @id @default(cuid())
+  organizationId    String
+  name              String
+  resolutionHours   Int
+  escalationHours   Int
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  disputes     Dispute[]
+
+  @@index([organizationId])
+}
+
+model Notification {
+  id          String   @id @default(cuid())
+  userId      String
+  disputeId   String?
+  type        NotificationType
+  title       String
+  message     String
+  isRead      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dispute     Dispute? @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([disputeId])
+  @@index([isRead])
+}
+
+enum NotificationType {
+  DISPUTE_CREATED
+  DISPUTE_ASSIGNED
+  DISPUTE_ESCALATED
+  DISPUTE_RESOLVED
+  DISPUTE_CLOSED
+  SLA_WARNING
+  SLA_BREACH
+}
+
+model AuditLog {
+  id            String   @id @default(cuid())
+  organizationId String
+  userId        String?
+  disputeId     String?
+  action        String
+  entity        String
+  changes       Json?
+  ipAddress     String?
+  userAgent     String?
+  createdAt     DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User? @relation("AuditUser", fields: [userId], references: [id], onDelete: SetNull)
+  dispute      Dispute? @relation("DisputeAudit", fields: [disputeId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([userId])
+  @@index([disputeId])
+  @@index([createdAt])
+}

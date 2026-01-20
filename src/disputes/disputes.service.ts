@@ -1,86 +1,77 @@
 import { Injectable, NotFoundException, ForbiddenException } from "@nestjs/common"
 import type { PrismaService } from "../prisma/prisma.service"
-import type { DisputeStateMachine } from "./dispute-state.machine"
+import { type DisputeStateMachine, UserRole } from "./dispute-state.machine"
 import type { CreateDisputeDto } from "./dto/create-dispute.dto"
 import type { TransitionDisputeDto } from "./dto/transition-dispute.dto"
-import { DisputeStatus, ActorType, type UserRole } from "./enums/dispute-status.enum"
-import type { Dispute, DisputeTransition, AuditLog } from "@prisma/client"
+import type { Dispute, DisputeStatus } from "@prisma/client"
+import type { AuditService } from "../audit/audit.service"
 
 @Injectable()
 export class DisputesService {
   constructor(
     private prisma: PrismaService,
     private stateMachine: DisputeStateMachine,
+    private auditService: AuditService,
   ) {}
 
   async createDispute(organizationId: string, createDisputeDto: CreateDisputeDto, userId: string): Promise<Dispute> {
-    const [customer, organization] = await Promise.all([
-      this.prisma.customer.findUnique({ where: { id: createDisputeDto.customerId } }),
+    const [user, organization] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: userId } }),
       this.prisma.organization.findUnique({ where: { id: organizationId } }),
     ])
 
-    if (!customer || !organization) {
-      throw new NotFoundException("Customer or Organization not found")
+    if (!user || !organization) {
+      throw new NotFoundException("User or Organization not found")
     }
 
-    const slaDeadline = new Date()
-    slaDeadline.setDate(slaDeadline.getDate() + 30) // 30-day SLA
-
-    const dispute = await this.prisma.dispute.create({
-      data: {
-        organizationId,
-        customerId: createDisputeDto.customerId,
-        category: createDisputeDto.category,
-        description: createDisputeDto.description,
-        monetaryImpact: createDisputeDto.monetaryImpact,
-        status: DisputeStatus.NEW,
-        slaDeadline,
-      },
-    })
-
-    await Promise.all([
-      this.prisma.auditLog.create({
+    const dispute = await this.prisma.$transaction(async (tx) => {
+      const newDispute = await tx.dispute.create({
         data: {
-          actorType: ActorType.SYSTEM,
-          actorId: userId,
-          action: "CREATE",
+          externalId: createDisputeDto.externalId,
+          organizationId,
+          createdById: userId,
+          reason: createDisputeDto.reason,
+          amount: createDisputeDto.amount,
+          currency: createDisputeDto.currency || "USD",
+        },
+      })
+
+      await tx.auditLog.create({
+        data: {
+          organizationId,
+          userId,
+          disputeId: newDispute.id,
+          action: "DISPUTE_CREATED",
           entity: "Dispute",
-          entityId: dispute.id,
-          metadata: { category: dispute.category, monetaryImpact: dispute.monetaryImpact },
+          changes: { reason: newDispute.reason, amount: newDispute.amount, status: newDispute.status },
         },
-      }),
-      this.prisma.disputeTransition.create({
-        data: {
-          disputeId: dispute.id,
-          fromState: DisputeStatus.NEW,
-          toState: DisputeStatus.NEW,
-          actorType: ActorType.SYSTEM,
-          actorId: userId,
-          reason: "Initial state",
-        },
-      }),
-    ])
+      })
+
+      return newDispute
+    })
 
     return dispute
   }
 
-  async listDisputes(
-    organizationId: string,
-    filters?: { status?: DisputeStatus; slaOverdue?: boolean },
-  ): Promise<Dispute[]> {
+  async listDisputes(organizationId: string, filters?: { status?: DisputeStatus; slaId?: string }): Promise<Dispute[]> {
     const where: any = { organizationId }
 
     if (filters?.status) {
       where.status = filters.status
     }
 
-    if (filters?.slaOverdue) {
-      where.slaDeadline = { lt: new Date() }
+    if (filters?.slaId) {
+      where.slaId = filters.slaId
     }
 
     return this.prisma.dispute.findMany({
       where,
       orderBy: { createdAt: "desc" },
+      include: {
+        createdBy: { select: { id: true, email: true, firstName: true, lastName: true } },
+        assignedTo: { select: { id: true, email: true, firstName: true, lastName: true } },
+        transitions: { orderBy: { createdAt: "desc" }, take: 5 },
+      },
     })
   }
 
@@ -88,9 +79,10 @@ export class DisputesService {
     const dispute = await this.prisma.dispute.findUnique({
       where: { id },
       include: {
+        createdBy: { select: { id: true, email: true, firstName: true, lastName: true, role: true } },
+        assignedTo: { select: { id: true, email: true, firstName: true, lastName: true, role: true } },
         transitions: { orderBy: { createdAt: "desc" } },
-        messages: { orderBy: { createdAt: "desc" } },
-        evidence: { orderBy: { createdAt: "desc" } },
+        sla: true,
       },
     })
 
@@ -106,8 +98,11 @@ export class DisputesService {
     organizationId: string,
     transitionDto: TransitionDisputeDto,
     userId: string,
-    userRole: UserRole,
-  ): Promise<{ dispute: Dispute; transition: DisputeTransition; auditLog: AuditLog }> {
+    userRole: string,
+  ): Promise<{
+    dispute: Dispute
+    message: string
+  }> {
     const [dispute, user] = await Promise.all([
       this.prisma.dispute.findUnique({ where: { id } }),
       this.prisma.user.findUnique({ where: { id: userId } }),
@@ -117,47 +112,148 @@ export class DisputesService {
       throw new NotFoundException("Dispute not found")
     }
 
-    if (!user || user.role !== userRole) {
-      throw new ForbiddenException("User role mismatch")
+    if (!user) {
+      throw new ForbiddenException("User not found")
     }
 
-    this.stateMachine.validateTransition(dispute.status, transitionDto.toState, userRole, ActorType.AGENT)
+    // Validate transition before entering transaction
+    this.stateMachine.validateTransition(
+      dispute.status as DisputeStatus,
+      transitionDto.toStatus as DisputeStatus,
+      userRole as UserRole,
+    )
 
-    const [updatedDispute, transition, auditLog] = await this.prisma.$transaction([
-      this.prisma.dispute.update({
-        where: { id },
-        data: { status: transitionDto.toState },
-      }),
-      this.prisma.disputeTransition.create({
-        data: {
-          disputeId: id,
-          fromState: dispute.status,
-          toState: transitionDto.toState,
-          actorType: ActorType.AGENT,
-          actorId: userId,
-          reason: transitionDto.reason || "",
-        },
-      }),
-      this.prisma.auditLog.create({
-        data: {
-          actorType: ActorType.AGENT,
-          actorId: userId,
-          action: "TRANSITION",
-          entity: "Dispute",
-          entityId: id,
-          metadata: {
-            fromState: dispute.status,
-            toState: transitionDto.toState,
+    const result = await this.prisma.$transaction(
+      async (tx) => {
+        // Update dispute status
+        const updatedDispute = await tx.dispute.update({
+          where: { id },
+          data: { status: transitionDto.toStatus, updatedAt: new Date() },
+        })
+
+        // Record transition
+        await tx.disputeTransition.create({
+          data: {
+            disputeId: id,
+            fromStatus: dispute.status as DisputeStatus,
+            toStatus: transitionDto.toStatus as DisputeStatus,
+            transitionedById: userId,
             reason: transitionDto.reason,
           },
-        },
-      }),
-    ])
+        })
+
+        // Log to audit trail (mandatory, never skipped)
+        await tx.auditLog.create({
+          data: {
+            organizationId,
+            userId,
+            disputeId: id,
+            action: "DISPUTE_TRANSITIONED",
+            entity: "Dispute",
+            changes: {
+              fromStatus: dispute.status,
+              toStatus: transitionDto.toStatus,
+              reason: transitionDto.reason,
+            },
+          },
+        })
+
+        return updatedDispute
+      },
+      {
+        timeout: 10000,
+      },
+    )
 
     return {
-      dispute: updatedDispute,
-      transition,
-      auditLog,
+      dispute: result,
+      message: `Dispute transitioned from ${dispute.status} to ${transitionDto.toStatus}`,
     }
+  }
+
+  async assignDispute(id: string, organizationId: string, assigneeId: string, userId: string): Promise<Dispute> {
+    const dispute = await this.prisma.dispute.findUnique({
+      where: { id },
+    })
+
+    if (!dispute || dispute.organizationId !== organizationId) {
+      throw new NotFoundException("Dispute not found")
+    }
+
+    const assignee = await this.prisma.user.findUnique({
+      where: { id: assigneeId },
+    })
+
+    if (!assignee) {
+      throw new NotFoundException("Assignee not found")
+    }
+
+    const updatedDispute = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.dispute.update({
+        where: { id },
+        data: { assignedToId: assigneeId, updatedAt: new Date() },
+        include: { assignedTo: true, createdBy: true },
+      })
+
+      await tx.auditLog.create({
+        data: {
+          organizationId,
+          userId,
+          disputeId: id,
+          action: "DISPUTE_ASSIGNED",
+          entity: "Dispute",
+          changes: { assignedToId: assigneeId, assignedToEmail: assignee.email },
+        },
+      })
+
+      return updated
+    })
+
+    return updatedDispute
+  }
+
+  async systemTransitionDispute(disputeId: string, toStatus: DisputeStatus, reason: string): Promise<Dispute> {
+    const dispute = await this.prisma.dispute.findUnique({
+      where: { id: disputeId },
+    })
+
+    if (!dispute) {
+      throw new NotFoundException("Dispute not found")
+    }
+
+    // Validate transition with SYSTEM role
+    this.stateMachine.validateTransition(dispute.status as DisputeStatus, toStatus, UserRole.SYSTEM)
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const updatedDispute = await tx.dispute.update({
+        where: { id: disputeId },
+        data: { status: toStatus, updatedAt: new Date() },
+      })
+
+      await tx.disputeTransition.create({
+        data: {
+          disputeId,
+          fromStatus: dispute.status as DisputeStatus,
+          toStatus,
+          transitionedById: "system",
+          reason: `[SYSTEM] ${reason}`,
+        },
+      })
+
+      await tx.auditLog.create({
+        data: {
+          organizationId: dispute.organizationId,
+          userId: null,
+          disputeId,
+          action: "DISPUTE_SYSTEM_ESCALATION",
+          entity: "Dispute",
+          changes: { reason: `System triggered: ${reason}` },
+        },
+      })
+
+      return updatedDispute
+    })
+
+    return result
   }
 }
